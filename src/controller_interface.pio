@@ -1,0 +1,87 @@
+.define ACKNOWLEDGE_PIN 19
+.define DATA_PIN        28
+.define ATTENTION_PIN   18
+.define CLOCK_PIN       20
+.define COMMAND_PIN     27
+
+
+
+.program frame_keeper
+initial_setup:
+    wait 1 gpio ATTENTION_PIN   ; Waits for the attention pin to rise before anything starts (We aren't just initializing at wait_for_frame_end in case we initialize right before a frame starts)
+
+.wrap_target
+frame_start:
+    wait 0 gpio ATTENTION_PIN   ; Waits for the attention pin to fall
+    irq  clear 2                ; Lets RX proceed if it was waiting for the frame to start (which it hopefully was doing)
+    irq  set 0                  ; This is set so that the main cpu can keep track of frames
+
+wait_for_frame_end:
+    wait 1 gpio ATTENTION_PIN   ; If the attention pin is high, jump to frame_reset
+
+frame_reset:
+    irq  clear 3                ; Lets RX proceed if it was waiting for the clock line to rise, or for the frame to end
+    irq  clear 4                ; Tells the TX state machine to reset
+    irq  set 1                  ; This is set so that the main cpu can keep track of frames
+.wrap
+
+
+
+.program time_keeper
+.wrap_target
+clock_cycle:
+    wait 0 gpio CLOCK_PIN       ; Waits for the clock to fall
+    wait 1 gpio CLOCK_PIN       ; Waits for the clock to rise
+    irq  clear 3                ; Lets RX proceed if it was waiting for the clock line to rise, or for the frame to end
+.wrap
+
+
+
+; The RX program is now using autopull
+.program interface_rx
+wait_frame:
+    mov isr, null               ; Clears the ISR
+    irq wait 2                  ; Waits for the frame to start
+
+.wrap_target
+idle:
+    irq wait 3                  ; Waits until flag 3 is cleared when either the frame has ended, or a new bit is ready to be read
+    jmp  pin wait_frame         ; If the attention pin is high, wait for a new frame, otherwise, read a bit into the ISR
+
+bit_read_loop:
+    in   pins, 1                ; Shift CMD bit into ISR (LSB-first)
+.wrap
+
+
+
+; This state machine has to run at 5 MHz to work properly
+.program interface_tx
+.side_set 1 opt pindirs
+.wrap_target
+idle:
+    pull block              ; Wait until the CPU gives this a byte to push
+
+ack_delay:
+    set  y, 6 [3]           ; Runs the delay loop 7 times (This instruction takes 4 clocks and each of the jumps take 8 which total to 60 clocks or 12 us at 5 MHz)
+
+delay_loop:
+    jmp  y-- delay_loop [7] ; Jump and then delay for 7 clocks
+
+send_ack:
+    set  y, 2 side 1    [3] ; Runs the delay loop 2 times (This instruction takes 4 clocks and each of the jumps take 8 which total to 20 clocks or 4 us at 5 MHz)
+
+ack_loop:
+    jmp  y-- ack_loop   [7] ; Jump and then delay for 7 clocks
+
+transmit:
+    set  y, 7 side 0        ; Transmit one byte from the current OSR.
+
+bit_loop:
+    wait 0 gpio CLOCK_PIN   ; Wait for the clock line to fall
+    out  pindirs, 1         ; OSR LSB -> DATA OE:
+    wait 1 gpio CLOCK_PIN   ; Wait for the clock line to rise
+    jmp  y-- bit_loop
+
+release_line:
+    set  pindirs, 0         ; Release Data
+.wrap
